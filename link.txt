@@ -1,3 +1,5 @@
 ifup ens33后在ip addr show就可以获取到ip
 
 redis-cli -h 127.0.0.1 -p 6379 -a 123456
+
+git push master master

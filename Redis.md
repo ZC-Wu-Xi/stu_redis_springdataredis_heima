@@ -2191,8 +2191,6 @@ public Result queryShopById(@PathVariable("id") Long id) {
 
 ![1653322190155](./RedisImg/1653322190155.png)
 
-
-
 ### 2.3 缓存更新策略
 
 缓存更新是redis为了节约内存而设计出来的一个东西，主要是因为内存数据宝贵，当我们向redis插入太多数据，此时就可能会导致缓存中的数据过多，所以redis会对部分数据进行更新，或者把他叫为淘汰更合适。
@@ -2205,19 +2203,15 @@ public Result queryShopById(@PathVariable("id") Long id) {
 
 ![1653322506393](./RedisImg/1653322506393.png)
 
-#### 2.3.1 、数据库缓存不一致解决方案：
-
-
+#### 2.3.1 、数据库缓存不一致解决方案
 
 由于我们的**缓存的数据源来自于数据库**,而数据库的**数据是会发生变化的**,因此,如果当数据库中**数据发生变化,而缓存却没有同步**,此时就会有**一致性问题存在**,其后果是:
 
-用户使用缓存中的过时数据,就会产生类似多线程数据安全问题,从而影响业务,产品口碑等;怎么解决呢？有如下几种方案
+用户使用缓存中的过时数据,就会产生类似多线程数据安全问题,从而影响业务,产品口碑等;怎么解决呢？有如下几种方案(**主动更新方案**)：
 
-Cache Aside Pattern 人工编码方式：缓存调用者在更新完数据库后再去更新缓存，也称之为双写方案
-
-Read/Write Through Pattern : 由系统本身完成，数据库与缓存的问题交由系统本身去处理
-
-Write Behind Caching Pattern ：调用者只操作缓存，其他线程去异步处理数据库，实现最终一致
+1. Cache Aside Pattern **人工编码**方式：缓存调用者在**更新完数据库后再去更新缓存**，也称之为双写方案
+2. Read/Write Through Pattern : 由系统本身完成，数据库与缓存的问题交由系统本身去处理，保证了强一致性
+3. Write Behind Caching Pattern **写回方式** ：**调用者只操作缓存**，其他线程去异步处理数据库，实现最终一致
 
 ![1653322857620](./RedisImg/1653322857620.png)
 
@@ -2227,14 +2221,14 @@ Write Behind Caching Pattern ：调用者只操作缓存，其他线程去异步
 
 操作缓存和数据库时有三个问题需要考虑：
 
-
-
 如果采用第一个方案，那么假设我们每次操作数据库后，都操作缓存，但是中间如果没有人查询，那么这个更新动作实际上只有最后一次生效，中间的更新动作意义并不大，我们可以把缓存删除，等待再次查询时，将缓存中的数据加载出来
 
 * 删除缓存还是更新缓存？
   * 更新缓存：每次更新数据库都更新缓存，无效写操作较多
   * 删除缓存：更新数据库时让缓存失效，查询时再更新缓存
 
+  > 一般选择删除缓存而不是更新缓存
+  
 * 如何保证缓存与数据库的操作的同时成功或失败？
   * 单体系统，将缓存与数据库操作放在一个事务
   * 分布式系统，利用TCC等分布式事务方案
@@ -2247,29 +2241,83 @@ Write Behind Caching Pattern ：调用者只操作缓存，其他线程去异步
 
 ![1653323595206](./RedisImg/1653323595206.png)
 
+缓存更新策略的最佳实践方案：
 
+1. 低一致性需求：使用Redis自带的内存淘汰机制
+2. 高一致性需求：主动更新，并以超时剔除作为兜底方案
+   - 读操作：
+     缓存命中则直接返回
+     缓存未命中则查询数据库，并写入缓存，设定超时时间
+   - 写操作：
+     先写数据库，然后再删除缓存
+     要确保数据库与缓存操作的原子性
 
 ### 2.4 实现商铺和缓存与数据库双写一致
+
+给查询商铺的缓存添加超时剔除和主动更新的策略
 
 核心思路如下：
 
 修改ShopController中的业务逻辑，满足下面的需求：
 
-根据id查询店铺时，如果缓存未命中，则查询数据库，将数据库结果写入缓存，并设置超时时间
-
-根据id修改店铺时，先修改数据库，再删除缓存
+- 根据id查询店铺时，如果缓存未命中，则查询数据库，将数据库结果写入缓存，并设置超时时间
+- 根据id修改店铺时，先修改数据库，再删除缓存
 
 **修改重点代码1**：修改**ShopServiceImpl**的queryById方法
 
 **设置redis缓存时添加过期时间**
 
-![1653325871232](./RedisImg/1653325871232.png)
+```java
+@Override
+public Result queryById(Long id) {
+    String key = CACHE_SHOP_KEY + id;
+    // 1. 从 redis 查询商铺缓存
+    String shopJson = stringRedisTemplate.opsForValue().get(key);
+
+    // 2. 判断是否存在
+    if (StrUtil.isNotBlank(shopJson)) { // 不为空
+        // 3. 存在，直接返回
+        Shop shop = JSONUtil.toBean(shopJson, Shop.class); // json转为shop对象
+        return Result.ok(shop);
+    }
+
+    // 4. redis不存在，查询数据库，
+    Shop shop = getById(id);
+    // 5. 数据库不存在返回错误
+    if (shop == null) {
+        return Result.fail("店铺不存在！");
+    }
+
+    // 6. 存在 将结果写入 redis
+    //        stringRedisTemplate.opsForValue().set(key, JSONUtil.toJsonStr(shop));
+    // 过期时间 30min
+    stringRedisTemplate.opsForValue().set(key, JSONUtil.toJsonStr(shop), CACHE_SHOP_TTL, TimeUnit.MINUTES);
+
+    // 7. 返回
+    return Result.ok(shop);
+}
+```
 
 **修改重点代码2**
 
 代码分析：通过之前的淘汰，我们确定了采用删除策略，来解决双写问题，当我们修改了数据之后，然后把缓存中的数据进行删除，查询时发现缓存中没有数据，则会从mysql中加载最新的数据，从而避免数据库和缓存不一致的问题
 
-![1653325929549](./RedisImg/1653325929549.png)
+```java
+@Override
+@Transactional
+public Result update(Shop shop) {
+    Long id = shop.getId();
+    if (id == null) {
+        return Result.fail("店铺id不能为空");
+    }
+    // 1. 更新数据库
+    updateById(shop);
+
+    // 2， 删除缓存
+    stringRedisTemplate.delete(CACHE_SHOP_KEY + id);
+    return Result.ok();
+}
+```
 
 ### 2.5 缓存穿透问题的解决思路
 
@@ -2277,22 +2325,20 @@ Write Behind Caching Pattern ：调用者只操作缓存，其他线程去异步
 
 常见的解决方案有两种：
 
-* 缓存空对象
+* **缓存空对象**
   * 优点：实现简单，维护方便
   * 缺点：
     * 额外的内存消耗
     * 可能造成短期的不一致
-* 布隆过滤
+* **布隆过滤**
   * 优点：内存占用较少，没有多余key
   * 缺点：
     * 实现复杂
     * 存在误判可能
 
-
+![1653326156516](./RedisImg/1653326156516.png)
 
 **缓存空对象思路分析：**当我们客户端访问不存在的数据时，先请求redis，但是此时redis中没有数据，此时会访问到数据库，但是数据库中也没有数据，这个数据穿透了缓存，直击数据库，我们都知道数据库能够承载的并发不如redis这么高，如果大量的请求同时过来访问这种不存在的数据，这些请求就都会访问到数据库，简单的解决方案就是哪怕这个数据在数据库中也不存在，我们也把这个数据存入到redis中去，这样，下次用户过来访问这个不存在的数据，那么在redis中也能找到这个数据就不会进入到缓存了
-
-
 
 **布隆过滤：**布隆过滤器其实采用的是哈希思想来解决这个问题，通过一个庞大的二进制数组，走哈希思想去判断当前这个要查询的这个数据是否存在，如果布隆过滤器判断存在，则放行，这个请求会去访问redis，哪怕此时redis中的数据过期了，但是数据库中一定存在这个数据，在数据库中查询出来这个数据后，再将其放入到redis中，
 
@@ -2300,19 +2346,13 @@ Write Behind Caching Pattern ：调用者只操作缓存，其他线程去异步
 
 这种方式优点在于节约内存空间，存在误判，误判原因在于：布隆过滤器走的是哈希思想，只要哈希思想，就可能存在哈希冲突
 
-![1653326156516](./RedisImg/1653326156516.png)
-
-
-
 ### 2.6 编码解决商品查询的缓存穿透问题：
 
 核心思路如下：
 
 在原来的逻辑中，我们如果发现这个数据在mysql中不存在，直接就返回404了，这样是会存在缓存穿透问题的
 
-现在的逻辑中：如果这个数据不存在，我们不会返回404 ，还是会把这个数据写入到Redis中，并且将value设置为空，欧当再次发起查询时，我们如果发现命中之后，判断这个value是否是null，如果是null，则是之前写入的数据，证明是缓存穿透数据，如果不是，则直接返回数据。
-
-
+**现在的逻辑中：如果这个数据不存在，我们不会返回404 ，还是会把这个数据写入到Redis中，并且将value设置为空**，当再次发起查询时，我们如果发现命中之后，判断这个value是否是null，如果是null，则是之前写入的数据，证明是缓存穿透数据，如果不是，则直接返回数据。(此案例我们缓存的是空字符串)
 
 ![1653327124561](./RedisImg/1653327124561.png)
 
@@ -2320,22 +2360,67 @@ Write Behind Caching Pattern ：调用者只操作缓存，其他线程去异步
 
 缓存穿透产生的原因是什么？
 
-* 用户请求的数据在缓存中和数据库中都不存在，不断发起这样的请求，给数据库带来巨大压力
+* 用户请求的数据在**缓存中和数据库中都不存在**，不断发起这样的请求，给数据库带来巨大压力
 
 缓存穿透的解决方案有哪些？
 
-* 缓存null值
+* 缓存null(或空字符串"")值
 * 布隆过滤
 * 增强id的复杂度，避免被猜测id规律
 * 做好数据的基础格式校验
 * 加强用户权限校验
 * 做好热点参数的限流
 
+```java
+@Override
+public Result queryById(Long id) {
+    String key = CACHE_SHOP_KEY + id;
+    // 1. 从 redis 查询商铺缓存
+    String shopJson = stringRedisTemplate.opsForValue().get(key);
 
+    // 2. 判断是否存在
+    if (StrUtil.isNotBlank(shopJson)) { // 不为空
+        // 3. 存在，直接返回
+        Shop shop = JSONUtil.toBean(shopJson, Shop.class); // json转为shop对象
+        return Result.ok(shop);
+    }
+
+    // 判断缓存命中的是否是空值 如果是空值则是之前写入的数据，证明是缓存穿透数据
+    if (shopJson != null) { // 查到了 且!=null 此时为“”，即缓存穿透数据
+        // 返回错误信息
+        return Result.fail("店铺信息不存在");
+    }
+
+    // 4. redis不存在，查询数据库，
+    Shop shop = getById(id);
+
+    // 5. 数据库不存在返回错误
+    if (shop == null) {
+        // 缓存穿透问题解决方式 将空值(空字符串)写入redis
+        stringRedisTemplate.opsForValue().set(key, "", CACHE_NULL_TTL, TimeUnit.MINUTES);
+        // 返回错误信息
+        return Result.fail("店铺不存在！");
+    }
+
+    // 6. 存在 将结果写入 redis
+    //        stringRedisTemplate.opsForValue().set(key, JSONUtil.toJsonStr(shop));
+    // 过期时间 30min
+    stringRedisTemplate.opsForValue().set(key, JSONUtil.toJsonStr(shop), CACHE_SHOP_TTL, TimeUnit.MINUTES);
+
+    // 7. 返回
+    return Result.ok(shop);
+}
+```
+
+数据库中没有id为0的商店，访问id为0的商店时向redis存入空字符串"",该值设置较短的有效期
+
+eg缓存穿透数据()：
+
+![image-20241115183155898](./RedisImg/image-20241115183155898.png)
 
 ### 2.7 缓存雪崩问题及解决思路
 
-缓存雪崩是指在同一时段大量的缓存key同时失效或者Redis服务宕机，导致大量请求到达数据库，带来巨大压力。
+**缓存雪崩**是指在同一时段**大量的缓存key**同时失效或者Redis服务宕机，导致大量请求到达数据库，带来巨大压力。
 
 解决方案：
 
@@ -2348,22 +2433,18 @@ Write Behind Caching Pattern ：调用者只操作缓存，其他线程去异步
 
 ### 2.8 缓存击穿问题及解决思路
 
-缓存击穿问题也叫热点Key问题，就是一个被高并发访问并且缓存重建业务较复杂的key突然失效了，无数的请求访问会在瞬间给数据库带来巨大的冲击。
+**缓存击穿问题**也叫热点Key问题，就是一个被**高并发访问**并且**缓存重建业务较复杂的key**突然失效了，无数的请求访问会在瞬间给数据库带来巨大的冲击。
 
-常见的解决方案有两种：
+**常见的解决方案有两种：**
 
-* 互斥锁
-* 逻辑过期
+1. 互斥锁
+2. 逻辑过期
 
-逻辑分析：假设线程1在查询缓存之后，本来应该去查询数据库，然后把这个数据重新加载到缓存的，此时只要线程1走完这个逻辑，其他线程就都能从缓存中加载这些数据了，但是假设在线程1没有走完的时候，后续的线程2，线程3，线程4同时过来访问当前这个方法， 那么这些线程都不能从缓存中查询到数据，那么他们就会同一时刻来访问查询缓存，都没查到，接着同一时间去访问数据库，同时的去执行数据库代码，对数据库访问压力过大
-
-
+**缓存击穿逻辑分析**：假设线程1在查询缓存之后，本来应该去查询数据库，然后把这个数据重新加载到缓存的，此时只要线程1走完这个逻辑，其他线程就都能从缓存中加载这些数据了，但是假设在线程1没有走完的时候，后续的线程2，线程3，线程4同时过来访问当前这个方法， 那么这些线程都不能从缓存中查询到数据，那么他们就会同一时刻来访问查询缓存，都没查到，接着同一时间去访问数据库，同时的去执行数据库代码，对数据库访问压力过大
 
 ![1653328022622](./RedisImg/1653328022622.png)
 
-
-
-解决方案一、使用锁来解决：
+**解决方案一、使用锁来解决：**
 
 因为锁能实现互斥性。假设线程过来，只能一个人一个人的来访问数据库，从而避免对于数据库访问压力过大，但这也会影响查询的性能，因为此时会让查询的性能从并行变成了串行，我们可以采用tryLock方法 + double check来解决这样的问题。
 
@@ -2371,23 +2452,26 @@ Write Behind Caching Pattern ：调用者只操作缓存，其他线程去异步
 
 ![1653328288627](./RedisImg/1653328288627.png)
 
-解决方案二、逻辑过期方案
+**解决方案二、逻辑过期方案**
 
 方案分析：我们之所以会出现这个缓存击穿问题，主要原因是在于我们对key设置了过期时间，假设我们不设置过期时间，其实就不会有缓存击穿的问题，但是不设置过期时间，这样数据不就一直占用我们内存了吗，我们可以采用逻辑过期方案。
 
-我们把过期时间设置在 redis的value中，注意：这个过期时间并不会直接作用于redis，而是我们后续通过逻辑去处理。假设线程1去查询缓存，然后从value中判断出来当前的数据已经过期了，此时线程1去获得互斥锁，那么其他线程会进行阻塞，获得了锁的线程他会开启一个 线程去进行 以前的重构数据的逻辑，直到新开的线程完成这个逻辑后，才释放锁， 而线程1直接进行返回，假设现在线程3过来访问，由于线程线程2持有着锁，所以线程3无法获得锁，线程3也直接返回数据，只有等到新开的线程2把重建数据构建完后，其他线程才能走返回正确的数据。
+我们**把过期时间设置在 redis的value中**，**注意：这个过期时间并不会直接作用于redis，而是我们后续通过逻辑去处理**。假设线程1去查询缓存，然后从value中判断出来当前的数据已经过期了，此时线程1去获得互斥锁，那么其他线程会进行阻塞，获得了锁的线程他会开启一个 线程去进行 以前的重构数据的逻辑，直  到新开的线程完成这个逻辑后，才释放锁， 而线程1直接进行返回，假设现在线程3过来访问，由于线程线程2持有着锁，所以线程3无法获得锁，线程3也直接返回数据，只有等到新开的线程2把重建数据构建完后，其他线程才能走返回正确的数据。
 
 这种方案巧妙在于，异步的构建缓存，缺点在于在构建完缓存之前，返回的都是脏数据。
 
 ![1653328663897](./RedisImg/1653328663897.png)
 
-进行对比
+**进行对比：**
 
-**互斥锁方案：**由于保证了互斥性，所以数据一致，且实现简单，因为仅仅只需要加一把锁而已，也没其他的事情需要操心，所以没有额外的内存消耗，缺点在于有锁就有死锁问题的发生，且只能串行执行性能肯定受到影响
+**互斥锁方案：**由于保证了互斥性，所以**数据一致**，且实现简单，因为仅仅只需要加一把锁而已，也没其他的事情需要操心，所以没有额外的内存消耗，缺点在于**有锁就有死锁问题的发生，且只能串行执行性能肯定受到影响**
 
-**逻辑过期方案：** 线程读取过程中不需要等待，性能好，有一个额外的线程持有锁去进行重构数据，但是在重构数据完成前，其他的线程只能返回之前的数据，且实现起来麻烦
+**逻辑过期方案：** 线程读取过程中不需要等待，**性能好**，有一个额外的线程持有锁去进行重构数据，**但是在重构数据完成前，其他的线程只能返回之前的数据**，且实现起来麻烦
 
-![1653357522914](./RedisImg/1653357522914.png)
+| 解决方案 | 优点                                             | 缺点                                           |
+| -------- | ------------------------------------------------ | ---------------------------------------------- |
+| 互斥锁   | 没有额外的内存消耗<br />保证一致性<br />实现简单 | 线程需要等待，性能受影响<br />可能有死锁风险   |
+| 逻辑过期 | 线程无需等待，性能较好                           | 不保证一致性<br />有额外内存消耗<br />实现复杂 |
 
 ### 2.9 利用互斥锁解决缓存击穿问题
 
@@ -2402,11 +2486,21 @@ Write Behind Caching Pattern ：调用者只操作缓存，其他线程去异步
 核心思路就是利用redis的setnx方法来表示获取锁，该方法含义是redis中如果没有这个key，则插入成功，返回1，在stringRedisTemplate中返回true，  如果有这个key则插入失败，则返回0，在stringRedisTemplate返回false，我们可以通过true，或者是false，来表示是否有线程成功插入key，成功插入的key的线程我们认为他就是获得到锁的线程。
 
 ```java
+/**
+ * 尝试获取锁
+ * @param key
+ * @return
+ */
 private boolean tryLock(String key) {
+    // SET key "1" NX EX 10  如果不存在key则新建key:1，过期时间为10s  值是1(随便设的)
     Boolean flag = stringRedisTemplate.opsForValue().setIfAbsent(key, "1", 10, TimeUnit.SECONDS);
-    return BooleanUtil.isTrue(flag);
+    return BooleanUtil.isTrue(flag); // 拆箱过程中有可能出现空指针Boolean->boolean，因此使用该工具类
 }
-
+    
+/**
+ * 释放锁
+ * @param key
+ */
 private void unlock(String key) {
     stringRedisTemplate.delete(key);
 }
@@ -2415,53 +2509,76 @@ private void unlock(String key) {
 **操作代码：**
 
 ```java
- public Shop queryWithMutex(Long id)  {
-        String key = CACHE_SHOP_KEY + id;
-        // 1、从redis中查询商铺缓存
-        String shopJson = stringRedisTemplate.opsForValue().get("key");
-        // 2、判断是否存在
-        if (StrUtil.isNotBlank(shopJson)) {
-            // 存在,直接返回
+/**
+ * 根据id查询店铺
+ * 缓存击穿 + 缓存穿透
+ * 互斥锁解决缓存击穿 且 缓存空对象解决缓存穿透
+ * @param id
+ * @return
+ */
+public Shop queryWithMutex(Long id) {
+    String key = CACHE_SHOP_KEY + id;
+    // 1. 从 redis 查询商铺缓存
+    String shopJson = stringRedisTemplate.opsForValue().get(key);
+
+    // 2. 判断是否存在
+    if (StrUtil.isNotBlank(shopJson)) { // 不为空
+        // 3. 存在，直接返回
+        return JSONUtil.toBean(shopJson, Shop.class);
+    }
+
+    // 判断缓存命中的是否是空值 如果是空值则是之前写入的数据，证明是缓存穿透数据
+    if (shopJson != null) { // 查到了 且!=null 此时为“”，即缓存穿透数据
+        return null;
+    }
+
+    // 4. 实现缓存重建
+    // 4.1 获取互斥锁
+    String lockKey = LOCK_SHOP_KEY + id;
+    Shop shop = null;
+    try {
+        boolean isLock = tryLock(lockKey);
+
+        // 4.2 获取是否获取成功 即使获取锁成功也有可能
+        if (!isLock) {
+            // 4.3 失败，则休眠并重试
+            Thread.sleep(50);
+            return queryWithMutex(id);
+        }
+
+        // A线程恢复Redis成功时,B线程的运行进度可能已经超过了第一次判断Redis中是否存在数据,而让B线程获取到释放的锁如果不再次判断,B线程会以为Redis并未修复,于是继续访问数据库
+        // 因此获取锁成功后,再次判断Redis是否存在,若存在则无需重建Redis,直接返回即可
+        if ( StrUtil.isNotBlank(shopJson)) {
+            System.out.println("Redis存在,直接返回");
+            //3. 若存在则直接返回
             return JSONUtil.toBean(shopJson, Shop.class);
         }
-        //判断命中的值是否是空值
-        if (shopJson != null) {
-            //返回一个错误信息
+
+        // 4.4. redis不存在，查询数据库，
+        shop = getById(id);
+        // 模拟重建缓存耗时
+        Thread.sleep(20000);
+
+        // 5. 数据库不存在返回错误
+        if (shop == null) {
+            // 缓存穿透问题解决方式 将空值(空字符串)写入redis
+            stringRedisTemplate.opsForValue().set(key, "", CACHE_NULL_TTL, TimeUnit.MINUTES);
             return null;
         }
-        // 4.实现缓存重构
-        //4.1 获取互斥锁
-        String lockKey = "lock:shop:" + id;
-        Shop shop = null;
-        try {
-            boolean isLock = tryLock(lockKey);
-            // 4.2 判断否获取成功
-            if(!isLock){
-                //4.3 失败，则休眠重试
-                Thread.sleep(50);
-                return queryWithMutex(id);
-            }
-            //4.4 成功，根据id查询数据库
-             shop = getById(id);
-            // 5.不存在，返回错误
-            if(shop == null){
-                 //将空值写入redis
-                stringRedisTemplate.opsForValue().set(key,"",CACHE_NULL_TTL,TimeUnit.MINUTES);
-                //返回错误信息
-                return null;
-            }
-            //6.写入redis
-            stringRedisTemplate.opsForValue().set(key,JSONUtil.toJsonStr(shop),CACHE_NULL_TTL,TimeUnit.MINUTES);
 
-        }catch (Exception e){
-            throw new RuntimeException(e);
-        }
-        finally {
-            //7.释放互斥锁
-            unlock(lockKey);
-        }
-        return shop;
+        // 6. 存在 将结果写入 redis
+        //        stringRedisTemplate.opsForValue().set(key, JSONUtil.toJsonStr(shop));
+        // 过期时间 30min
+        stringRedisTemplate.opsForValue().set(key, JSONUtil.toJsonStr(shop), CACHE_SHOP_TTL, TimeUnit.MINUTES);
+    } catch (InterruptedException e) {
+        throw new RuntimeException(e);
+    } finally {
+        // 7. 释放互斥锁
+        unlock(lockKey);
     }
+    // 8. 返回
+    return shop;
+}
 ```
 
 ###  3.0 、利用逻辑过期解决缓存击穿问题
