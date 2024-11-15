@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="VcsDirectoryMappings">
+    <mapping directory="" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/nginx-1.18.0/nginx-1.18.0/html/hmdp" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/stu-jedis-redis-demo" vcs="Git" />
+    <mapping directory="$PROJECT_DIR$/stu-springdataredis/stu-springdataredis" vcs="Git" />
+  </component>
+</project>
