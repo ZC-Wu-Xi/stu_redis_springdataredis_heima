@@ -36,14 +36,23 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
     // 自定义的缓存的工具类，用于解决缓存穿透和缓存击穿
     @Resource
     private CacheClient cacheClient;
+    @Resource
+    private ShopMapper shopMapper;
 
     @Override
     public Result queryById(Long id) {
         // 缓存空串解决缓存穿透(使用工具类)
 //        Shop shop = cacheClient.queryWithPassThrough(CACHE_SHOP_KEY, id, Shop.class, this::getById, CACHE_SHOP_TTL, TimeUnit.MINUTES);
 
+        // 现在我们为了都能查到，仅对id为1的设为热点key
+        // 对于其他id我们先委屈一下，去查mysql
         // 逻辑过期解决缓存击穿(使用工具类)
-        Shop shop = cacheClient.queryWithLogicalExpire(CACHE_SHOP_KEY, id, Shop.class, this::getById, CACHE_SHOP_TTL, TimeUnit.MINUTES);
+        Shop shop = null;
+        if (id == 1) { // id为1的商店为热点key
+            shop = cacheClient.queryWithLogicalExpire(CACHE_SHOP_KEY, id, Shop.class, this::getById, CACHE_SHOP_TTL, TimeUnit.SECONDS);
+        } else {
+            shop = shopMapper.selectById(id);
+        }
 
         // (缓存空串)缓存穿透
 //        Shop shop = queryWithPassThrough(id);

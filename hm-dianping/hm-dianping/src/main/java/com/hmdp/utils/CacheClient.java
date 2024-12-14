@@ -57,7 +57,7 @@ public class CacheClient {
         redisData.setData(value);
         redisData.setExpireTime(LocalDateTime.now().plusSeconds(unit.toSeconds(time)));
         // 写入redis
-        stringRedisTemplate.opsForValue().set(key, JSONUtil.toJsonStr(value));
+        stringRedisTemplate.opsForValue().set(key, JSONUtil.toJsonStr(redisData));
     }
 
     /**
